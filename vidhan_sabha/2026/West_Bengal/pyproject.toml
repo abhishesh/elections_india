@@ -6,4 +6,6 @@ requires-python = ">=3.10"
 dependencies = [
     "beautifulsoup4",
     "requests",
+    "selenium>=4.43.0",
+    "webdriver-manager>=4.0.2",
 ]

@@ -3,9 +3,9 @@ ECI Election Results Scraper for West Bengal Vidhan Sabha 2026.
 
 Fetches HTML from ECI result pages and converts table data to CSV.
 
-NOTE: results.eci.gov.in requires a browser-like Referer header and may
-also enforce JavaScript challenges. If you get 403 responses, save the raw
-HTML files locally from a browser and run this script with --local-dir.
+Uses Selenium (browser automation) by default to handle JavaScript and
+anti-bot measures. Falls back to requests + BeautifulSoup4, then stdlib
+urllib + HTMLParser if dependencies aren't available.
 
 Usage:
     uv run scrape_eci_results.py
@@ -24,6 +24,19 @@ import urllib.request
 from html.parser import HTMLParser
 from io import StringIO
 from pathlib import Path
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.common.by import By
+    from webdriver_manager.chrome import ChromeDriverManager
+    from selenium.webdriver.chrome.service import Service
+
+    USE_SELENIUM = True
+except ImportError:
+    USE_SELENIUM = False
 
 try:
     import requests
@@ -55,6 +68,37 @@ HEADERS = {
     "Referer": REFERER,
     "Connection": "keep-alive",
 }
+
+
+def fetch_html_selenium(url: str, retries: int) -> str | None:
+    """Fetch HTML using Selenium to handle JavaScript and anti-bot measures."""
+    for attempt in range(1, retries + 1):
+        driver = None
+        try:
+            options = Options()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument(f"user-agent={HEADERS['User-Agent']}")
+
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.get(url)
+
+            WebDriverWait(driver, 30).until(
+                lambda driver: driver.execute_script("return document.readyState") == "complete"
+            )
+
+            html = driver.page_source
+            return html
+        except Exception as exc:
+            print(f"  [attempt {attempt}/{retries}] {exc}")
+            if attempt < retries:
+                time.sleep(2)
+        finally:
+            if driver:
+                driver.quit()
+    return None
 
 
 def fetch_html_requests(session: requests.Session, url: str, retries: int) -> str | None:
@@ -201,10 +245,19 @@ def write_rows(rows: list[list[str]], output_csv: Path) -> None:
 
 
 def scrape_remote(output_csv: Path, retries: int, delay: float) -> int:
-    print(f"Using {'requests + BeautifulSoup4' if USE_BS4 else 'stdlib urllib + HTMLParser'}\n")
+    method = "Selenium"
+    if USE_SELENIUM:
+        print("Using Selenium (browser automation)\n")
+    elif USE_BS4:
+        print("Using requests + BeautifulSoup4\n")
+        method = "requests + BeautifulSoup4"
+    else:
+        print("Using stdlib urllib + HTMLParser\n")
+        method = "stdlib urllib + HTMLParser"
 
-    session = requests.Session() if USE_BS4 else None
-    if session:
+    session = None
+    if not USE_SELENIUM and USE_BS4:
+        session = requests.Session()
         try:
             session.get(
                 REFERER,
@@ -221,11 +274,13 @@ def scrape_remote(output_csv: Path, retries: int, delay: float) -> int:
         page_id = url.split(f"statewise{STATE_CODE}")[-1].replace(".htm", "")
         print(f"[{idx:02d}/{len(URLS)}] Fetching page {page_id}: {url}")
 
-        html = (
-            fetch_html_requests(session, url, retries)
-            if session
-            else fetch_html_stdlib(url, retries)
-        )
+        if USE_SELENIUM:
+            html = fetch_html_selenium(url, retries)
+        elif session:
+            html = fetch_html_requests(session, url, retries)
+        else:
+            html = fetch_html_stdlib(url, retries)
+
         if html is None:
             print("  Failed. Skipping.\n")
             continue
@@ -246,16 +301,29 @@ def scrape_remote(output_csv: Path, retries: int, delay: float) -> int:
 
     if not all_rows:
         print("\nNo data collected.")
-        print(
-            """
+        if USE_SELENIUM:
+            print(
+                """
+Selenium failed to retrieve data. Possible causes:
+  1. ChromeDriver not available or Chrome not installed
+  2. Network issues or site blocking.
+
+Fallback option:
+  - Save pages manually in your browser into an html_pages directory, then run:
+      python scrape_eci_results.py --local-dir html_pages
+"""
+            )
+        else:
+            print(
+                """
 results.eci.gov.in may be blocking automated requests.
 
 Options:
   1. Save pages manually in your browser into an html_pages directory, then run:
        python scrape_eci_results.py --local-dir html_pages
-  2. Use a browser automation tool such as Playwright to fetch the page HTML.
+  2. Install Selenium: uv add selenium webdriver-manager
 """
-        )
+            )
         return 1
 
     write_rows(all_rows, output_csv)
